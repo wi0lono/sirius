@@ -74,8 +74,9 @@ __device__ void extract_domain(cudf::string_view* out, cuda::std::optional<cudf:
 }
 )***";
 
-    return cudf::transform({input}, udf, cudf::data_type{cudf::type_id::STRING}, false,
-                            std::nullopt, cudf::null_aware::YES);
+    // return cudf::transform({input}, udf, cudf::data_type{cudf::type_id::STRING}, false,
+    //                        std::nullopt, cudf::null_aware::YES);
+    return cudf::make_empty_column(cudf::type_id::STRING);
 }
 
 } // namespace expression
