@@ -231,6 +231,8 @@ template
 __global__ void materialize_without_null<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
 template
 __global__ void materialize_without_null<int64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const int64_t *a, int64_t* result, uint64_t *row_ids, uint64_t N);
+template
+__global__ void materialize_without_null<float2, BLOCK_THREADS, ITEMS_PER_THREAD>(const float2 *a, float2* result, uint64_t *row_ids, uint64_t N);
 
 template
 __global__ void materialize_expression_with_null<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, int* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
@@ -242,6 +244,8 @@ template
 __global__ void materialize_expression_with_null<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, double* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
 template
 __global__ void materialize_expression_with_null<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
+template
+__global__ void materialize_expression_with_null<float2, BLOCK_THREADS, ITEMS_PER_THREAD>(const float2 *a, float2* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
 
 template <typename T>
 void materializeWithoutNull(T *a, T*& result, uint64_t *row_ids, uint64_t result_len) {
@@ -492,6 +496,8 @@ template
 void materializeWithoutNull<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len);
 template
 void materializeWithoutNull<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len);
+template
+void materializeWithoutNull<float2>(float2 *a, float2*& result, uint64_t *row_ids, uint64_t result_len);
 
 template
 void materializeExpression<int16_t>(int16_t *a, int16_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
@@ -509,5 +515,7 @@ template
 void materializeExpression<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
 template
 void materializeExpression<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
+void materializeExpression<float2>(float2 *a, float2*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
 
 } // namespace duckdb

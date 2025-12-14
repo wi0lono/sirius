@@ -81,6 +81,9 @@ GPUBufferManager::customCudaMalloc<string_group_by_record_type>(size_t size, int
 template string_top_n_record_type*
 GPUBufferManager::customCudaMalloc<string_top_n_record_type>(size_t size, int gpu, bool caching);
 
+template float2*
+GPUBufferManager::customCudaMalloc<float2>(size_t size, int gpu, bool caching);
+
 template uint8_t**
 GPUBufferManager::customCudaMalloc<uint8_t*>(size_t size, int gpu, bool caching);
 

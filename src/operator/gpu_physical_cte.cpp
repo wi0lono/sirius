@@ -55,8 +55,9 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 		working_table_gpu->columns[col_idx] = make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]);
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.data, 0);
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->row_ids, 0);
-		// If the column type is VARCHAR, also lock the offset allocation
-		if (working_table_gpu->columns[col_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+		// If the column type is VARCHAR/BLOB, also lock the offset allocation
+		if (working_table_gpu->columns[col_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR ||
+				working_table_gpu->columns[col_idx]->data_wrapper.type.id() == GPUColumnTypeId::BLOB) {
 			gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.offset, 0);
 		}
 	}

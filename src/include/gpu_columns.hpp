@@ -19,11 +19,61 @@
 #include "helper/common.h"
 #include "duckdb/common/types.hpp"
 #include "cudf_utils.hpp"
+#include "duckdb/common/string_util.hpp"
 using namespace std;
 
 namespace duckdb {
 
 class GPUBufferManager;
+
+struct alignas(8) float2 {
+    float x;
+    float y;
+};
+
+inline bool isPointStructold(const LogicalType &t) {
+    if (t.id() != LogicalTypeId::STRUCT) return false;
+    auto &ch = StructType::GetChildTypes(t);
+    return ch.size() == 2 &&
+           ch[0].first == "x" && ch[0].second.id() == LogicalTypeId::FLOAT &&
+           ch[1].first == "y" && ch[1].second.id() == LogicalTypeId::FLOAT;
+}
+
+inline bool isPointStruct(const LogicalType &t) {
+    if (t.id() != LogicalTypeId::STRUCT) {
+        return false;
+    }
+    auto alias = StringUtil::Lower(t.GetAlias());
+    if (alias == "point_2d" || alias == "point") {
+        return true;
+    }
+    const auto &children = StructType::GetChildTypes(t);
+    if (children.size() != 2) {
+        return false;
+    }
+    if (!(children[0].first == "x" && children[1].first == "y")) {
+        return false;
+    }
+    auto is_numeric_coord = [](LogicalTypeId id) {
+        switch (id) {
+            case LogicalTypeId::FLOAT:
+            case LogicalTypeId::DOUBLE:
+            case LogicalTypeId::SMALLINT:
+            case LogicalTypeId::INTEGER:
+            case LogicalTypeId::BIGINT:
+            case LogicalTypeId::UTINYINT:
+            case LogicalTypeId::USMALLINT:
+            case LogicalTypeId::UINTEGER:
+            case LogicalTypeId::UBIGINT:
+                return true;
+            default:
+                return false;
+        }
+    };
+    return is_numeric_coord(children[0].second.id()) && is_numeric_coord(children[1].second.id());
+}
+
+
 
 int32_t* convertUInt64ToInt32(uint64_t* data, size_t N);
 uint64_t* convertInt32ToUInt64(int32_t* data, size_t N);
@@ -52,7 +102,9 @@ enum class GPUColumnTypeId {
     TIMESTAMP_NS,
     VARCHAR,
     INT128,
-    DECIMAL
+    DECIMAL,
+    BLOB,
+    POINT_2D
 };
 
 struct GPUDecimalTypeInfo {
@@ -91,6 +143,7 @@ private:
 };
 
 inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
+    auto alias_lower = StringUtil::Lower(type.GetAlias());
     switch (type.id()) {
         case LogicalTypeId::SMALLINT:
             return GPUColumnType(GPUColumnTypeId::INT16);
@@ -123,10 +176,35 @@ inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
             column_type.SetDecimalTypeInfo(DecimalType::GetWidth(type), DecimalType::GetScale(type));
             return column_type;
         }
+        case LogicalTypeId::BLOB: {
+            // Geometry columns arrive as BLOB with alias "GEOMETRY"
+            if (alias_lower == "geometry") {
+                return GPUColumnType(GPUColumnTypeId::BLOB);
+            }
+            return GPUColumnType(GPUColumnTypeId::BLOB);
+        }
+        case LogicalTypeId::STRUCT: {
+            if (isPointStruct(type)) return GPUColumnType(GPUColumnTypeId::POINT_2D);
+            break;
+        }
+        case LogicalTypeId::USER: {
+            auto alias = StringUtil::Lower(type.GetAlias());
+            if (alias == "point_2d") {
+                return GPUColumnType(GPUColumnTypeId::POINT_2D);
+            }
+            break;
+        }
         default:
-            throw InvalidInputException("Unsupported duckdb column type in `convertLogicalTypeToColumnType`: %d",
-                                        static_cast<int>(type.id()));
+            throw InvalidInputException("Unsupported duckdb column type in `convertLogicalTypeToColumnType`:  %s (%d, alias=%s)",
+                                        type.ToString(),
+                            static_cast<int>(type.id()),
+                                type.GetAlias().c_str());
     }
+    // seems to be extra for the compiler
+    throw InvalidInputException("extra compiler Unsupported duckdb column type in `convertLogicalTypeToColumnType`: %s (%d, alias=%s)",
+                                type.ToString(),
+                            static_cast<int>(type.id()),
+                                type.GetAlias().c_str());
 }
 
 inline LogicalType convertColumnTypeToLogicalType(const GPUColumnType& type) {
@@ -164,6 +242,11 @@ inline LogicalType convertColumnTypeToLogicalType(const GPUColumnType& type) {
 			}
 			return LogicalType::DECIMAL(decimal_type_info->width_, decimal_type_info->scale_);
 		}
+        case GPUColumnTypeId::BLOB:
+			return LogicalType::BLOB;
+		case GPUColumnTypeId::POINT_2D:
+			// return LogicalType::STRUCT({{"x", LogicalType::FLOAT}, {"y", LogicalType::FLOAT}}, "POINT_2D");
+            return LogicalType::STRUCT({{"x", LogicalType::FLOAT}, {"y", LogicalType::FLOAT}});
 		default:
 			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
 																		static_cast<int>(type.id()));

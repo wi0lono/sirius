@@ -24,6 +24,9 @@
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/string_util.hpp"
+// #include "duckdb/common/types/struct_type.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "gpu_columns.hpp"
 #include "gpu_materialize.hpp"
 #include "utils.hpp"
@@ -31,7 +34,55 @@
 
 namespace duckdb {
 
+static inline bool IsVarLenType(const LogicalType &type) {
+  return type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::BLOB;
+}
+
+static inline bool IsGeometryType(const LogicalType &type) {
+  return type.id() == LogicalTypeId::BLOB && StringUtil::Lower(type.GetAlias()) == "geometry";
+}
+
+static inline bool IsPointStructType(const LogicalType &type) {
+  auto alias = StringUtil::Lower(type.GetAlias());
+  return type.id() == LogicalTypeId::STRUCT && (alias == "point_2d" || alias == "point");
+}
+
+static inline bool HasGeometryColumns(const vector<LogicalType> &types) {
+  for (auto &t : types) {
+    if (IsGeometryType(t) || IsPointStructType(t)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Decode a WKB POINT (little endian) into float2. Throws if not a POINT.
+static inline float2 DecodeWkbPoint(const string_t &wkb) {
+  const uint8_t *ptr = reinterpret_cast<const uint8_t *>(wkb.GetDataUnsafe());
+  auto len = wkb.GetSize();
+  if (len < 1 + 4 + 16) {
+    throw InvalidInputException("WKB too short for POINT");
+  }
+  uint8_t endian = ptr[0];
+  if (endian != 1) {
+    throw InvalidInputException("Unsupported non-little-endian WKB");
+  }
+  uint32_t geom_type;
+  memcpy(&geom_type, ptr + 1, sizeof(uint32_t));
+  if (geom_type != 1) {
+    throw InvalidInputException("Geometry is not POINT, type=%u", geom_type);
+  }
+  double x, y;
+  memcpy(&x, ptr + 1 + 4, sizeof(double));
+  memcpy(&y, ptr + 1 + 4 + 8, sizeof(double));
+  float2 out{static_cast<float>(x), static_cast<float>(y)};
+  return out;
+}
+
 uint64_t GetChunkDataByteSize(LogicalType type, idx_t cardinality) {
+  	if (IsPointStructType(type)) {
+		return cardinality * sizeof(float2);
+	}
 		auto physical_size = GetTypeIdSize(type.InternalType());
 		return cardinality * physical_size;
 }
@@ -586,7 +637,7 @@ public:
       l_state_scan.num_rows += chunk->size();      
       for (int col = 0; col < num_cols; col++) {
         auto& vec = chunk->data[col];
-        if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
+        if (IsVarLenType(vec.GetType())) {
           vec.Flatten(chunk->size());
           auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
           auto &validity = FlatVector::Validity(vec);
@@ -651,7 +702,7 @@ public:
         if (!op.already_cached[col]) {
           auto& vec = chunk->data[col];
           vec.Flatten(chunk->size());
-          if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
+          if (IsVarLenType(vec.GetType())) {
             auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
             auto &validity = FlatVector::Validity(vec);
             for (int row = 0; row < num_rows_aligned; row++) {
@@ -693,7 +744,7 @@ public:
           auto& vec = chunk->data[col];
           // For data
           auto &validity = FlatVector::Validity(vec);
-          if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
+          if (IsVarLenType(vec.GetType())) {
             auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
             // For rows with null mask aligned
             uint64_t chunk_data_offset = 0;
@@ -857,7 +908,7 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
       if (!already_cached[col]) {
         total_size += column_size[col];
         total_size += mask_size[col];
-        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+        if (IsVarLenType(scanned_types[col])) {
           // Add size of offsets
           total_size += sizeof(uint64_t) * (num_rows + 1);
         }
@@ -922,7 +973,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
       if (!already_cached[col]) {
         data_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
         mask_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(mask_size[col]);
-        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+        if (IsVarLenType(scanned_types[col])) {
           offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_rows + 1);
           offset_ptr[col][0] = 0;
         }
@@ -988,7 +1039,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
       if (!already_cached[col]) {
         d_data_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
         d_mask_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(mask_size[col], 0, 1);
-        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+        if (IsVarLenType(scanned_types[col])) {
           d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows + 1, 0, 1);
         }
       }
@@ -1015,7 +1066,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
                           cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
           write_offset += write_len;
         }
-        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+        if (IsVarLenType(scanned_types[col])) {
           // For offsets
           write_offset = 0;
           while (write_offset < sizeof(uint64_t) * (num_rows + 1)) {
@@ -1051,7 +1102,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     int num_prefix_sum = 0;
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
       if (!already_cached[col]) {
-        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+        if (IsVarLenType(scanned_types[col])) {
           callCubPrefixSum(d_offset_ptr[col], d_offset_ptr[col], num_rows + 1, true,
                            cuda_streams[num_prefix_sum++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS],
                            [&](size_t size) {
@@ -1074,7 +1125,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
         GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
         table->columns[column_idx]->column_length = num_rows;
         cudf::bitmask_type* validity_mask = reinterpret_cast<cudf::bitmask_type*>(d_mask_ptr[col]);
-        if (scanned_types[col] == LogicalType::VARCHAR) {
+        if (IsVarLenType(scanned_types[col])) {
           table->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_data_ptr[col], d_offset_ptr[col],
                                                                  num_rows, column_size[col], true, validity_mask);
         } else {
@@ -1154,7 +1205,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
   SIRIUS_LOG_DEBUG("GPUPhysicalTableScan GetDataDuckDB invoked");
 
   // Use optimized scan if required
-  if (Config::USE_OPT_TABLE_SCAN) {
+  if (Config::USE_OPT_TABLE_SCAN && !HasGeometryColumns(scanned_types)) {
     return GetDataDuckDBOpt(exec_context);
   }
 
@@ -1212,10 +1263,24 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
             Vector vec = chunk->data[col];
             vec.Flatten(chunk->size());
-            if (vec.GetType() == LogicalType::VARCHAR) {
+            if (IsGeometryType(vec.GetType())) {
+              // Validate all non-null values are POINT
+              auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
+              auto &validity = FlatVector::Validity(vec);
               for (int row = 0; row < chunk->size(); row++) {
-                std::string curr_string = vec.GetValue(row).ToString();
-                column_size[col] += curr_string.length();
+                if (!validity.RowIsValid(row)) {
+                  continue;
+                }
+                DecodeWkbPoint(duckdb_strings[row]); // throws if not point
+              }
+              column_size[col] += chunk->size() * sizeof(float2);
+            } else if (IsVarLenType(vec.GetType())) {
+              auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
+              auto &validity = FlatVector::Validity(vec);
+              for (int row = 0; row < chunk->size(); row++) {
+                if (validity.RowIsValid(row)) {
+                  column_size[col] += duckdb_strings[row].GetSize();
+                }
               }
             } else {
               column_size[col] += GetChunkDataByteSize(scanned_types[col], chunk->size());
@@ -1290,7 +1355,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
           mask_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(mask_size[col]);
           memset(mask_ptr[col], 0, mask_size[col] * sizeof(uint8_t));
           d_mask_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(mask_size[col], 0, 1);
-          if (scanned_types[col] == LogicalType::VARCHAR) {
+          if (IsVarLenType(scanned_types[col])) {
             offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(collection->Count() + 1);
             d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(collection->Count() + 1, 0, 1);
             offset_ptr[col][0] = 0;
@@ -1316,12 +1381,73 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
           if (!already_cached[col]) {
             Vector vec = result->data[col];
             vec.Flatten(result->size());
-            if (vec.GetType() == LogicalType::VARCHAR) {
+            if (IsGeometryType(vec.GetType())) {
+              auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
+              auto &validity = FlatVector::Validity(vec);
+              auto out = reinterpret_cast<float2*>(tmp_ptr[col]);
               for (int row = 0; row < result->size(); row++) {
-                std::string curr_string = vec.GetValue(row).ToString();
-                memcpy(tmp_ptr[col], curr_string.data(), curr_string.length());
-                offset_ptr[col][start_idx + row + 1] = offset_ptr[col][start_idx + row] + curr_string.length();
-                tmp_ptr[col] += curr_string.length();
+                if (validity.RowIsValid(row)) {
+                  out[row] = DecodeWkbPoint(duckdb_strings[row]);
+                } else {
+                  out[row] = float2{0.0f, 0.0f};
+                }
+              }
+              tmp_ptr[col] += result->size() * sizeof(float2);
+            } else if (IsPointStructType(vec.GetType())) {
+              auto &children = StructVector::GetEntries(vec);
+              if (children.size() < 2) {
+                throw InvalidInputException("POINT_2D struct must have at least two fields");
+              }
+              children[0]->Flatten(result->size());
+              children[1]->Flatten(result->size());
+              auto &validity = FlatVector::Validity(vec);
+              auto out = reinterpret_cast<float2*>(tmp_ptr[col]);
+              if (children[0]->GetType().id() == LogicalTypeId::DOUBLE) {
+                auto x_double = FlatVector::GetData<double>(*children[0]);
+                auto y_double = FlatVector::GetData<double>(*children[1]);
+                for (int row = 0; row < result->size(); row++) {
+                  if (validity.RowIsValid(row)) {
+                    out[row] = float2{static_cast<float>(x_double[row]), static_cast<float>(y_double[row])};
+                  } else {
+                    out[row] = float2{0.0f, 0.0f};
+                  }
+                }
+              } else if (children[0]->GetType().id() == LogicalTypeId::FLOAT) {
+                auto x_float = FlatVector::GetData<float>(*children[0]);
+                auto y_float = FlatVector::GetData<float>(*children[1]);
+                for (int row = 0; row < result->size(); row++) {
+                  if (validity.RowIsValid(row)) {
+                    out[row] = float2{x_float[row], y_float[row]};
+                  } else {
+                    out[row] = float2{0.0f, 0.0f};
+                  }
+                }
+              } else if (children[0]->GetType().id() == LogicalTypeId::INTEGER || children[0]->GetType().id() == LogicalTypeId::SMALLINT || children[0]->GetType().id() == LogicalTypeId::BIGINT) {
+                auto x_int = FlatVector::GetData<int64_t>(*children[0]);
+                auto y_int = FlatVector::GetData<int64_t>(*children[1]);
+                for (int row = 0; row < result->size(); row++) {
+                  if (validity.RowIsValid(row)) {
+                    out[row] = float2{static_cast<float>(x_int[row]), static_cast<float>(y_int[row])};
+                  } else {
+                    out[row] = float2{0.0f, 0.0f};
+                  }
+                }
+              } else {
+                throw InvalidInputException("Unsupported POINT_2D child types");
+              }
+              tmp_ptr[col] += result->size() * sizeof(float2);
+            } else if (IsVarLenType(vec.GetType())) {
+              auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
+              auto &validity = FlatVector::Validity(vec);
+              for (int row = 0; row < result->size(); row++) {
+                if (validity.RowIsValid(row)) {
+                  auto len = duckdb_strings[row].GetSize();
+                  memcpy(tmp_ptr[col], duckdb_strings[row].GetDataUnsafe(), len);
+                  offset_ptr[col][start_idx + row + 1] = offset_ptr[col][start_idx + row] + len;
+                  tmp_ptr[col] += len;
+                } else {
+                  offset_ptr[col][start_idx + row + 1] = offset_ptr[col][start_idx + row];
+                }
               }
             } else {
               memcpy(tmp_ptr[col], vec.GetData(), GetChunkDataByteSize(scanned_types[col], result->size()));
@@ -1345,7 +1471,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
 
       for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         if (!already_cached[col]) {
-            if (scanned_types[col] == LogicalType::VARCHAR) {
+            if (IsVarLenType(scanned_types[col])) {
               if (column_size[col] != offset_ptr[col][collection->Count()]) {
                 throw InvalidInputException("Column size mismatch");
               }
@@ -1370,9 +1496,12 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
             }
             int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
             GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
+            if (IsGeometryType(scanned_types[col])) {
+              column_type = GPUColumnType(GPUColumnTypeId::POINT_2D);
+            }
             gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
             cudf::bitmask_type* validity_mask = reinterpret_cast<cudf::bitmask_type*>(d_mask_ptr[col]);
-            if (scanned_types[col] == LogicalType::VARCHAR) {
+            if (IsVarLenType(scanned_types[col])) {
               gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true, validity_mask);
             } else {
               gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], collection->Count(), validity_mask);

@@ -27,6 +27,8 @@
 #include "log/logging.hpp"
 #include "utils.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
+#include "gpu_columns.hpp"
+#include "duckdb/common/types/vector.hpp"
 
 namespace duckdb {
 
@@ -106,12 +108,13 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		size_t num_rows = input_relation.columns[col]->row_id_count;
 		uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes; cudf::bitmask_type* out_mask = nullptr;
 		cudf::bitmask_type* mask = input_relation.columns[col]->data_wrapper.validity_mask;
+		GPUColumnType output_type = input_relation.columns[col]->data_wrapper.type;
 
 		SIRIUS_LOG_DEBUG("Running string late materalization with {} rows", num_rows);
 
 		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows, mask, out_mask);
 
-		output_relation.columns[col] = make_shared_ptr<GPUColumn>(num_rows, GPUColumnType(GPUColumnTypeId::VARCHAR), reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true, out_mask);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(num_rows, output_type, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true, out_mask);
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
@@ -158,7 +161,12 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		FinalMaterializeInternal<uint8_t>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(uint8_t);
 		break;
+	case GPUColumnTypeId::POINT_2D:
+		FinalMaterializeInternal<float2>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(float2);
+		break;
 	case GPUColumnTypeId::VARCHAR:
+	case GPUColumnTypeId::BLOB:
 		FinalMaterializeString(input_relation, output_relation, col);
 		break;
 	case GPUColumnTypeId::DECIMAL: {
@@ -206,7 +214,7 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
 	size_t all_columns_total_chars = 0;
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		DataWrapper column_data_wrapper = input_relation.columns[col]->data_wrapper;
-		if(column_data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+		if(column_data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || column_data_wrapper.type.id() == GPUColumnTypeId::BLOB) {
 			all_columns_num_strings += column_data_wrapper.size;
 			all_columns_total_chars += column_data_wrapper.num_bytes;
 		}
@@ -242,7 +250,7 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
 
 		const GPUColumnType& col_type = input_relation.columns[col]->data_wrapper.type;
 		bool is_string = false;
-		if(col_type.id() != GPUColumnTypeId::VARCHAR) {
+		if(col_type.id() != GPUColumnTypeId::VARCHAR && col_type.id() != GPUColumnTypeId::BLOB) {
 			if (types[col].InternalType() == PhysicalType::INT128) {
 				if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
 					SIRIUS_LOG_DEBUG("Converting INT64 to INT128 for column {}", col);
@@ -354,15 +362,50 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
-			if (materialized_relation.columns[col]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) {
+							auto col_type = materialized_relation.columns[col]->data_wrapper.type;
+				if (col_type.id() == GPUColumnTypeId::POINT_2D) {
+					auto point_data = reinterpret_cast<float2*>(host_data[col]) + read_index;
+					ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
+					if (types[col].id() == LogicalTypeId::STRUCT) {
+						Vector point_vec(types[col]);
+						auto &entries = StructVector::GetEntries(point_vec);
+						auto x_data = FlatVector::GetData<float>(*entries[0]);
+						auto y_data = FlatVector::GetData<float>(*entries[1]);
+						for (idx_t i = 0; i < chunk_cardinality; i++) {
+							x_data[i] = point_data[i].x;
+							y_data[i] = point_data[i].y;
+						}
+						FlatVector::SetValidity(point_vec, validity_mask);
+						chunk.data[col].Reference(point_vec);
+					} else if (types[col].id() == LogicalTypeId::BLOB) {
+						Vector blob_vec(types[col]);
+						auto blob_data = FlatVector::GetData<string_t>(blob_vec);
+						for (idx_t i = 0; i < chunk_cardinality; i++) {
+							uint8_t buf[1 + 4 + 16];
+							buf[0] = 1; // little endian
+							uint32_t geom_type = 1;
+							memcpy(buf + 1, &geom_type, sizeof(uint32_t));
+							double x = point_data[i].x;
+							double y = point_data[i].y;
+							memcpy(buf + 1 + 4, &x, sizeof(double));
+							memcpy(buf + 1 + 4 + 8, &y, sizeof(double));
+							blob_data[i] = StringVector::AddString(blob_vec, reinterpret_cast<const char*>(buf), sizeof(buf));
+						}
+						FlatVector::SetValidity(blob_vec, validity_mask);
+						chunk.data[col].Reference(blob_vec);
+					} else {
+						throw InvalidInputException("Unsupported logical type for POINT_2D output");
+					}
+				} else if (col_type.id() != GPUColumnTypeId::VARCHAR &&
+						col_type.id() != GPUColumnTypeId::BLOB) {
 				uint8_t* data = host_data[col] + vec * STANDARD_VECTOR_SIZE * GetTypeIdSize(types[col].InternalType());
 				Vector vector(types[col], data);
 				ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
 				FlatVector::SetValidity(vector, validity_mask);
 				chunk.data[col].Reference(vector);
 			} else {
-				// Add the strings to the vector
-				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + read_index));
+				// Add the strings/blobs to the vector
+					Vector str_vector(types[col], reinterpret_cast<data_ptr_t>(duckdb_strings[col] + read_index));
 				ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
 				FlatVector::SetValidity(str_vector, validity_mask);
 				chunk.data[col].Reference(str_vector);

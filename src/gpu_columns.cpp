@@ -103,7 +103,10 @@ DataWrapper::getColumnTypeSize() const {
         case GPUColumnTypeId::BOOLEAN:
             return sizeof(uint8_t);
         case GPUColumnTypeId::VARCHAR:
+        case GPUColumnTypeId::BLOB:
             return 128;
+        case GPUColumnTypeId::POINT_2D:
+            return sizeof(float2);
         case GPUColumnTypeId::DECIMAL: {
             GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
             if (decimal_type_info == nullptr) {
@@ -196,7 +199,7 @@ GPUColumn::convertToCudfColumn() {
     } else if (data_wrapper.type.id() == GPUColumnTypeId::TIMESTAMP_NS) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
-    } else if (data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::VARCHAR || data_wrapper.type.id() == GPUColumnTypeId::BLOB) {
         //convert offset to int32
         // int32_t* new_offset = convertSiriusOffsetToCudfOffset();
 
@@ -275,7 +278,8 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
             cudf::column::contents child_cont = cont.children[0]->release();
             gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
             data_wrapper.is_string_data = true;
-            data_wrapper.type = GPUColumnType(GPUColumnTypeId::VARCHAR);
+            data_wrapper.type = (data_wrapper.type.id() == GPUColumnTypeId::BLOB)
+                ? GPUColumnType(GPUColumnTypeId::BLOB) : GPUColumnType(GPUColumnTypeId::VARCHAR);
             int32_t* temp_offset = reinterpret_cast<int32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
             convertCudfOffsetToSiriusOffset(temp_offset);
             //copy data from offset to num_bytes
@@ -286,7 +290,8 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
             cudf::column::contents child_cont = cont.children[0]->release();
             gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
             data_wrapper.is_string_data = true;
-            data_wrapper.type = GPUColumnType(GPUColumnTypeId::VARCHAR);
+            data_wrapper.type = (data_wrapper.type.id() == GPUColumnTypeId::BLOB)
+                ? GPUColumnType(GPUColumnTypeId::BLOB) : GPUColumnType(GPUColumnTypeId::VARCHAR);
             data_wrapper.offset = reinterpret_cast<uint64_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
             //copy data from offset to num_bytes
             uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -563,6 +568,7 @@ GPUColumn::GetData() {
         case GPUColumnTypeId::BOOLEAN:
             return reinterpret_cast<uint8_t*>(GetDataBoolean());
         case GPUColumnTypeId::VARCHAR:
+        case GPUColumnTypeId::BLOB:
             return reinterpret_cast<uint8_t*>(GetDataVarChar());
         default:
             return nullptr;

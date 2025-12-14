@@ -95,6 +95,8 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuB
             return ResolveTypeMaterializeExpression<double>(column, gpuBufferManager);
         case GPUColumnTypeId::BOOLEAN:
             return ResolveTypeMaterializeExpression<uint8_t>(column, gpuBufferManager);
+        case GPUColumnTypeId::POINT_2D:
+            return ResolveTypeMaterializeExpression<float2>(column, gpuBufferManager);
         case GPUColumnTypeId::VARCHAR:
             return ResolveTypeMaterializeString(column, gpuBufferManager);
         case GPUColumnTypeId::DECIMAL: {
